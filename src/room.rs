@@ -21,6 +21,7 @@ use tokio_tungstenite::{
 };
 
 
+type Shared<T> = Arc<RwLock<T>>;
 type SharedMap<K, V> = Arc<RwLock<HashMap<K, V>>>;
 
 #[derive(Debug, Snafu)]
@@ -33,29 +34,52 @@ pub enum RoomError {
     WrongCode,
 }
 
-pub struct Room {
-    capacity: RwLock<u32>,
-    code: RwLock<String>,
+/// Basic room configurations read by every entity, but only host can write.
+struct Room {
+    code: String,
+    capacity: usize,
+    entity_map: SharedMap<SocketAddr, Entity>,
 }
 
-impl Room {
-    pub fn default() -> Self {
-        Room {
-            capacity: RwLock::new(10),
-            code: RwLock::new(gen_str(6)),
-        }
+/// This pattern makes it impossible to keep the lock across an await.
+/// https://users.rust-lang.org/t/mutable-struct-fields-with-async-await/45395/7
+#[derive(Clone)]
+struct RoomHandle {
+    inner: Shared<Room>,
+}
+
+impl RoomHandle {
+    pub fn default(entity_map: SharedMap<SocketAddr, Entity>) -> Self {
+        let room = Arc::new(RwLock::new(
+            Room {
+                capacity: 10,
+                code: gen_str(6),
+                entity_map,
+            }));
+        Self {inner: room}
     }
 
-    pub fn get_code(&self) -> String {
-        self.code.read().unwrap().clone()
+    fn write_lock<F, T>(&self, func: F) -> T
+    where F: FnOnce(&mut Room) -> T,
+    {
+        let mut guarded = self.inner.write().unwrap(); // acquire write guard, aka lock
+        let result = func(&mut *guarded);
+        drop(guarded); // release lock
+        result
     }
 
-    pub fn change_capacity(&self, n: i32) -> Result<(), RoomError> {
-        Ok(())
+    pub fn change_capacity(&self, new_capacity: usize) -> Result<(), RoomError> {
+        self.write_lock(|room| {
+            if new_capacity >= room.entity_map.read().unwrap().keys().len() { // Rust be like
+                room.capacity = new_capacity;
+                return Ok(());
+            }
+            Err(RoomError::CapacityTooLow)
+        })
     }
 }
 
-/// Generate random string of given length
+/// Generate random string of given length.
 fn gen_str(len: usize) -> String {
     let mut rng = thread_rng();
     std::iter::repeat(())
@@ -66,8 +90,8 @@ fn gen_str(len: usize) -> String {
 }
 
 async fn handle_connection<T>(
-    room: Arc<Room>,
-    room_tx: Sender<T>,
+    room: RoomHandle,
+    state_tx: Sender<T>,
     tx_map: SharedMap<SocketAddr, Sender<T>>,
     raw_stream: TcpStream,
     addr: SocketAddr
@@ -89,8 +113,8 @@ async fn handle_connection<T>(
 }
 
 async fn handle_state<'a, T>(
-    room: Arc<Room>,
-    room_rx: Receiver<T>,
+    room: RoomHandle,
+    state_rx: Receiver<T>,
     entity_map: SharedMap<SocketAddr, Entity>
 ) where T: Send + Sync
 {
@@ -106,18 +130,22 @@ pub async fn room_process(listener: TcpListener) -> WsResult<()> {
     // info!("Listening on: {}", listener.local_addr().unwrap());
 
     // Sender end of channels for connection tasks to communicate
-    let tx_map: SharedMap<SocketAddr, Sender<Message>> = Arc::new(RwLock::new(HashMap::new()));
+    let tx_map = Arc::new(RwLock::new(HashMap::new()));
 
     // Entities updated by central thread to manage state
-    let entity_map: SharedMap<SocketAddr, Entity> = Arc::new(RwLock::new(HashMap::new()));
+    let entity_map = Arc::new(RwLock::new(HashMap::new()));
 
-    let (room_tx, room_rx) = channel::<Message>(50);
+    // Channel to communicate with state thread
+    let (state_tx, state_rx) = channel::<Message>(50);
+
+    let mut futures = vec![];
 
     // Room configurations
-    let room: Arc<Room> = Arc::new(Room::default());
+    let room: RoomHandle = RoomHandle::default(entity_map.clone());
 
     // Spawn task to manage room state
-    task::spawn(handle_state(room.clone(), room_rx, entity_map.clone()));
+    let fut = task::spawn(handle_state(room.clone(), state_rx, entity_map.clone()));
+    futures.push(fut);
 
     // Handle each new connection
     while let Ok((raw_stream, addr)) = listener.accept().await {
@@ -128,8 +156,9 @@ pub async fn room_process(listener: TcpListener) -> WsResult<()> {
         entity_map.write().unwrap().insert(addr, entity);
 
         // Spawn a task for the new connection
-        task::spawn(handle_connection(room.clone(), room_tx.clone(), tx_map.clone(),
-                                      raw_stream, addr));
+        let fut = task::spawn(handle_connection(room.clone(), state_tx.clone(), tx_map.clone(),
+                                                raw_stream, addr));
+        futures.push(fut);
     }
 
     Ok(())
