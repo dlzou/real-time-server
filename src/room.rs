@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use tokio::{
+    io,
     task,
     net::{TcpListener, TcpStream},
 };
@@ -70,12 +71,23 @@ impl RoomHandle {
 
     pub fn change_capacity(&self, new_capacity: usize) -> Result<(), RoomError> {
         self.write_lock(|room| {
-            if new_capacity >= room.entity_map.read().unwrap().keys().len() { // Rust be like
+            if new_capacity >= room.entity_map.read().unwrap().keys().len() {
                 room.capacity = new_capacity;
                 return Ok(());
             }
             Err(RoomError::CapacityTooLow)
         })
+    }
+
+    pub fn authorize(&self, input_code: String) -> Result<(), RoomError> {
+        let mut guarded = self.inner.read().unwrap();
+        if input_code != guarded.code {
+            return Err(RoomError::WrongCode);
+        }
+        if guarded.entity_map.read().unwrap().keys().len() >= guarded.capacity {
+            return Err(RoomError::CapacityExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -105,8 +117,9 @@ async fn handle_connection<T>(
     tx_map.write().unwrap().insert(addr, tx);
 
     let connection_event = stream.try_for_each(|msg| {
+        // Rate limiting?
         info!("Received a message from {}", addr);
-        let senders = tx_map.read().unwrap();
+        tx.send_all(&mut stream).await.expect("Failed to send from tx");
 
         future::ok(())
     });
@@ -136,29 +149,50 @@ pub async fn room_process(listener: TcpListener) -> WsResult<()> {
     let entity_map = Arc::new(RwLock::new(HashMap::new()));
 
     // Channel to communicate with state thread
-    let (state_tx, state_rx) = channel::<Message>(50);
-
-    let mut futures = vec![];
+    let (state_tx, state_rx) = channel::<Message>(100);
 
     // Room configurations
     let room: RoomHandle = RoomHandle::default(entity_map.clone());
 
     // Spawn task to manage room state
-    let fut = task::spawn(handle_state(room.clone(), state_rx, entity_map.clone()));
-    futures.push(fut);
+    task::spawn(handle_state(room.clone(), state_rx, entity_map.clone()));
 
     // Handle each new connection
     while let Ok((raw_stream, addr)) = listener.accept().await {
-        // Validate connection
+        // Authorize connection
+        let mut authorized = false;
+        let mut msg = vec![0; 1024];
+        loop {
+            raw_stream.readable().await.expect("Raw stream not readable");
+            match raw_stream.try_read(&mut msg) {
+                Ok(m) => {
+                    authorized = match room.authorize(String::from("hello")) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("Error accepting connection: {}", e);
+                            false
+                        },
+                    };
+                    break;
+                },
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    continue;
+                },
+                Err(e) => {
+                    break;
+                },
+            }
+        }
 
-        // Create entity and add it to entity_map
-        let entity = Entity::new(String::from("placeholder"), false, (0.0, 0.0, 0.0));
-        entity_map.write().unwrap().insert(addr, entity);
+        if authorized {
+            // Create entity and add it to entity_map
+            let entity = Entity::new(String::from("placeholder"), false, (0.0, 0.0, 0.0));
+            entity_map.write().unwrap().insert(addr, entity);
 
-        // Spawn a task for the new connection
-        let fut = task::spawn(handle_connection(room.clone(), state_tx.clone(), tx_map.clone(),
-                                                raw_stream, addr));
-        futures.push(fut);
+            // Spawn a task for the new connection
+            let fut = task::spawn(handle_connection(room.clone(), state_tx.clone(), tx_map.clone(),
+                                                    raw_stream, addr));
+        }
     }
 
     Ok(())
