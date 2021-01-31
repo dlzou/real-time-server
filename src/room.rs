@@ -1,6 +1,6 @@
 use crate::entity::Entity;
 use futures::{
-    channel::mpsc::{channel, Receiver, Sender},
+    channel::mpsc,
     prelude::*,
 };
 use log::info;
@@ -18,7 +18,10 @@ use tokio::{
 };
 use tokio_tungstenite::{
     accept_async,
-    tungstenite::{error::Result as WsResult, protocol::Message}
+    tungstenite::{
+        error::{Error as WsError, Result as WsResult},
+        protocol::Message,
+    }
 };
 
 
@@ -80,7 +83,7 @@ impl RoomHandle {
     }
 
     pub fn authorize(&self, input_code: String) -> Result<(), RoomError> {
-        let mut guarded = self.inner.read().unwrap();
+        let guarded = self.inner.read().unwrap();
         if input_code != guarded.code {
             return Err(RoomError::WrongCode);
         }
@@ -101,36 +104,49 @@ fn gen_str(len: usize) -> String {
         .collect()
 }
 
-async fn handle_connection<T>(
+enum Event {
+    Move(f32, f32, f32),
+    Position(f32, f32, f32),
+    Close,
+}
+
+async fn handle_connection(
     room: RoomHandle,
-    state_tx: Sender<T>,
-    tx_map: SharedMap<SocketAddr, Sender<T>>,
-    raw_stream: TcpStream,
+    state_tx: mpsc::UnboundedSender<Event>,
+    tx_map: SharedMap<SocketAddr, mpsc::UnboundedSender<Message>>,
+    tcp_stream: TcpStream,
     addr: SocketAddr
-) where T: Send + Sync
-{
-    let socket = accept_async(raw_stream).await.expect("Handshake failed");
+) {
+    let socket = accept_async(tcp_stream).await.expect("Handshake failed");
     println!("WebSocket connection established: {}", addr);
     let (sink, stream) = socket.split();
 
-    let (tx, rx) = channel::<T>(50);
-    tx_map.write().unwrap().insert(addr, tx);
+    let (tx, rx) = mpsc::unbounded();
+    tx_map.write().unwrap().insert(addr.clone(), tx);
 
-    let connection_event = stream.try_for_each(|msg| {
+    let events = stream.try_for_each(|msg| {
         // Rate limiting?
         info!("Received a message from {}", addr);
-        tx.send_all(&mut stream).await.expect("Failed to send from tx");
+        match msg {
+            Message::Text(t) => {
+                state_tx.unbounded_send(Event::Move(1.0, 1.0, 1.0)).unwrap();
+            },
+            Message::Close(c) => {
+                tx_map.write().unwrap().remove(&addr);
+                return future::err::<_, WsError>(WsError::ConnectionClosed);
+            }
+            _ => (),
+        }
 
         future::ok(())
     });
 }
 
-async fn handle_state<'a, T>(
+async fn handle_state(
     room: RoomHandle,
-    state_rx: Receiver<T>,
+    state_rx: mpsc::UnboundedReceiver<Event>,
     entity_map: SharedMap<SocketAddr, Entity>
-) where T: Send + Sync
-{
+) {
     // Get message from connections
 
     // Update state via simulation
@@ -149,7 +165,8 @@ pub async fn room_process(listener: TcpListener) -> WsResult<()> {
     let entity_map = Arc::new(RwLock::new(HashMap::new()));
 
     // Channel to communicate with state thread
-    let (state_tx, state_rx) = channel::<Message>(100);
+    // let (state_tx, state_rx) = mpsc::channel::<Message>(100);
+    let (state_tx, state_rx) = mpsc::unbounded();
 
     // Room configurations
     let room: RoomHandle = RoomHandle::default(entity_map.clone());
@@ -158,13 +175,13 @@ pub async fn room_process(listener: TcpListener) -> WsResult<()> {
     task::spawn(handle_state(room.clone(), state_rx, entity_map.clone()));
 
     // Handle each new connection
-    while let Ok((raw_stream, addr)) = listener.accept().await {
+    while let Ok((tcp_stream, addr)) = listener.accept().await {
         // Authorize connection
         let mut authorized = false;
         let mut msg = vec![0; 1024];
         loop {
-            raw_stream.readable().await.expect("Raw stream not readable");
-            match raw_stream.try_read(&mut msg) {
+            tcp_stream.readable().await.expect("Raw stream not readable");
+            match tcp_stream.try_read(&mut msg) {
                 Ok(m) => {
                     authorized = match room.authorize(String::from("hello")) {
                         Ok(()) => true,
@@ -191,7 +208,7 @@ pub async fn room_process(listener: TcpListener) -> WsResult<()> {
 
             // Spawn a task for the new connection
             let fut = task::spawn(handle_connection(room.clone(), state_tx.clone(), tx_map.clone(),
-                                                    raw_stream, addr));
+                                                    tcp_stream, addr));
         }
     }
 
